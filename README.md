@@ -53,7 +53,7 @@ python3.12 ./data/gefcom2014_wind_setup.py
 python3.12 ./data/gefcom2014_solar_setup.py
 ```
 
-Download the **pre-trained models** to replicate the reported results on the GEFCom2014-Wind and GEFCom2014-Solar tasks.
+Download the **pre-trained model checkpoints** from [Google Drive](https://drive.google.com/drive/folders/1q7c9HQrmy1IeCv1nnWs-LZDO34hgZUz7?usp=sharing) to reproduce the reported results on the GEFCom2014-Wind and GEFCom2014-Solar tasks.
 
 > **Hardware note:** By default, the method runs on a GPU. Ensure that your GPU is compatible with your PyTorch installation, and update the package versions if necessary.
 
@@ -102,3 +102,9 @@ python3.12 ./demo_fit.py --json ./json/GEFCOM_W/exp_wind_5.json
 ```bash
 python3.12 ./demo_eval.py --json ./json/GEFCOM_W/exp_wind_5.json
 ```
+
+## Citation
+
+If you use any part of this implementation in your research, please cite the following paper:
+
+> C. Symeonidis and N. Nikolaidis, “DEF3C: Robust Multi-Source Conditioning for Diffusion-Based Energy Forecasting,” *Neural Computing and Applications*, accepted for publication, 2026.

@@ -1,0 +1,61 @@
+{
+	"exp":
+	{
+		"id": 4,
+		"log_dir": "./logs/wind_4",
+		"checkpoints_dir": "./checkpoints/wind_4"
+	},
+"dataset":
+	{
+		"name": "GEFCOM2014_WIND_15",
+		"n_e": 10,
+		"n_w":10,
+		"t_h":336,
+		"t_f":24,
+		"w_channels": 4,
+		"t_channels": 0,
+		"data_dir": "./data/GEFCOM2014_WIND"
+	},
+"diffusion":
+	{
+		"num_steps": 40,
+		"scheduler": "linear",
+		"beta_start": 0.0001,
+		"beta_end": 0.4,
+		"gamma": 5.0,
+		"rescale_betas": true,
+        "x0_thres": 8.0
+	},
+"net":
+	{
+		"num_ref_hgls": 3,
+		"num_den_hgls": 3,
+		"d_channels": 48,
+		"r_channels": 48,
+		"emb_channels": 32,
+		"sp_channels": 32,
+		"head_channels": 16,
+		"device": "cuda"
+	},
+"training":
+{
+        "use_huber": true,
+		"huber_delta": 3.0,
+		"l_r": 0.0005,
+		"batch_size": 16,
+		"dropout": 0.1,
+		"dropout_att": 0.1,
+	    "dropout_cond": 0.1,
+		"weight_decay_den": 2e-4,
+		"weight_decay_cond": 2e-4,
+		"weight_decay_sp": 2e-4,
+		"log_iters": 500,
+        "smooth_weight": 0.01,
+        "consistency_weight": 0.25,
+        "eval_seeds": [0]
+	},
+"eval":
+	{
+		"seeds": [0, 1, 2, 3]
+	}
+}

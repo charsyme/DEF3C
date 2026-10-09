@@ -1,0 +1,62 @@
+{
+"exp":
+	{
+		"id": 4,
+		"log_dir": "./logs/solar_4",
+		"checkpoints_dir": "./checkpoints/solar_4"
+	},
+"dataset":
+	{
+		"name": "GEFCOM2014_SOLAR_15",
+		"n_e": 3,
+		"n_w":3,
+		"t_h":336,
+		"t_f":24,
+		"w_channels": 12,
+		"t_channels": 4,
+		"data_dir": "./data/GEFCOM2014_SOLAR"
+	},
+"diffusion":
+	{
+		"num_steps": 40,
+		"scheduler": "linear",
+		"beta_start": 0.0001,
+		"beta_end": 0.4,
+		"gamma": 5.0,
+		"rescale_betas": true,
+        "x0_thres": 8.0
+	},
+"net":
+	{
+		"num_ref_hgls": 3,
+		"num_den_hgls": 3,
+		"d_channels": 48,
+		"r_channels": 48,
+		"emb_channels": 32,
+		"sp_channels": 32,
+		"head_channels": 16,
+		"device": "cuda",
+		"self_cond_x0": true
+	},
+"training":
+{
+        "use_huber": true,
+		"huber_delta": 3.0,
+		"l_r": 0.0001,
+		"batch_size": 16,
+		"dropout": 0.1,
+		"dropout_att": 0.2,
+		"dropout_cond": 0.2,
+		"weight_decay_den": 1e-4,
+		"weight_decay_cond": 1e-4,
+		"weight_decay_sp": 1e-4,
+		"log_iters": 250,
+        "smooth_weight": 0.1,
+        "consistency_weight": 0.1,
+        "eval_seeds": [0]
+	},
+"eval":
+	{
+		"seeds": [0, 1, 2, 3]
+	}
+}

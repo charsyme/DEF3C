@@ -87,7 +87,7 @@ python3.12 ./replicate_results.py --json ./json/GEFCOM_S/exp_solar_1.json --best
 | MAE | 0.034 | 0.036 | 0.034 | 0.035 |
 | RMSE | 0.079 | 0.080 | 0.075 | 0.078 |
 | R² | 0.796 | 0.797 | 0.836 | 0.810 |
-| CRPS | 0.267 | 0.274 | 0.224 | 0.255 |
+| CRPS | 0.268 | 0.271 | 0.226 | 0.255 |
 
 ## Execution demos
 

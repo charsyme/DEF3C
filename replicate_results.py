@@ -6,25 +6,7 @@ import json
 from types import SimpleNamespace
 from tqdm import tqdm
 import csv
-
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--json', type=str, default='./json/gefcom_w_1.json')
-parser.add_argument('--results_dir', type=str, default='./results')
-parser.add_argument('--num_exps', type=int, default=4)
-#parser.add_argument('--best_epochs', type=int, default=[15, 13, 18, 13])
-parser.add_argument("--best_epochs", type=int, nargs="+", default=[19, 17, 12, 16], )
-parser.add_argument('--num_samples', type=int, default=100)
-parser.add_argument('--sample_chunk', type=int, default=8)
-
-params = parser.parse_args()
-
-with open(params.json, 'r') as j:
-    params_json = json.loads(j.read(), object_hook=lambda d: SimpleNamespace(**d))
-params = SimpleNamespace(**params.__dict__, **params_json.__dict__)
-
-if not os.path.isdir(params.results_dir):
-    os.makedirs(params.results_dir, exist_ok=True)
+import sys
 
 
 def write_metric_csv(path, values, precision=5):
@@ -34,60 +16,92 @@ def write_metric_csv(path, values, precision=5):
         for exp_id in range(values.shape[0]):
             writer.writerow([f"{values[exp_id, s]:.{precision}f}" for s in range(values.shape[1])])
 
+def update_progress(completed, n_windows, batch_id, num_batches, generated, num_samples,):
+    if interactive:
+        if pbar.total is None:
+            pbar.total = n_evaluations * n_windows * num_samples
+        pbar.set_postfix_str(f"E{cnt + 1}/{params.num_exps} " f"S{seed_idx + 1}/{n_seeds} "
+                             f"B{batch_id}/{num_batches} " f"K{generated}/{num_samples}", refresh=False,)
+        pbar.update(completed)
+    elif generated == num_samples:
+        processed = min(batch_id * params.batch_size, n_windows)
+        print(f"Exp {cnt + 1}/{params.num_exps}, " f"seed {seed_idx + 1}/{n_seeds}: "
+              f"{processed}/{n_windows} windows completed", flush=True,)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--json', type=str, default='./json/gefcom_w_1.json')
+parser.add_argument('--results_dir', type=str, default='./results')
+parser.add_argument('--num_exps', type=int, default=4)
+parser.add_argument('--best_epochs', type=int, nargs="+", default=[19, 17, 12, 16], )
+parser.add_argument('--num_samples', type=int, default=100)
+parser.add_argument('--sample_chunk', type=int, default=20)
+parser.add_argument('--batch_size', type=int, default=8)
+parser.add_argument('--progress_mode', choices=['auto', 'bar', 'log'], default='auto',
+                    help='auto: detect terminal; bar: force live progress; log: one line per completed batch')
+
+params = parser.parse_args()
+with open(params.json, 'r') as j:
+    params_json = json.loads(j.read(), object_hook=lambda d: SimpleNamespace(**d))
+params = SimpleNamespace(**params.__dict__, **params_json.__dict__)
+
+if not os.path.isdir(params.results_dir):
+    os.makedirs(params.results_dir, exist_ok=True)
 
 def3c = DEF_3C(params)
-
-pbar = tqdm(desc="Finalizing results...", total=params.num_exps)
 start_id = int(params.exp.checkpoints_dir.split('_')[-1])
-test_mae = np.zeros([params.num_exps, params.dataset.n_e])
-test_rmse = np.zeros([params.num_exps, params.dataset.n_e])
-test_huber = np.zeros([params.num_exps, params.dataset.n_e])
-test_r2 = np.zeros([params.num_exps, params.dataset.n_e])
-test_crps = np.zeros([params.num_exps, params.dataset.n_e])
 
+test_mae = np.zeros((params.num_exps, params.dataset.n_e))
+test_rmse = np.zeros((params.num_exps, params.dataset.n_e))
+test_huber = np.zeros((params.num_exps, params.dataset.n_e))
+test_r2 = np.zeros((params.num_exps, params.dataset.n_e))
+test_crps = np.zeros((params.num_exps, params.dataset.n_e))
 
-cnt = 0
-for j in range(start_id, start_id + params.num_exps):
-    checkpoints_dir = '_'.join(params.exp.checkpoints_dir.split('_')[:-1]) + '_' + str(j)
-    filepath = checkpoints_dir + '/checkpoint_epoch_ema_' + str(params.best_epochs[cnt]) + '.zip'
-    def3c.load(filepath)
+interactive = sys.stderr.isatty() if params.progress_mode == "auto" else params.progress_mode == "bar"
+n_seeds = len(params.eval.seeds)
+if n_seeds == 0:
+    raise ValueError("At least one evaluation seed is required.")
+if len(params.best_epochs) < params.num_exps:
+    raise ValueError("Provide a best epoch for every experiment.")
 
-    for seed_idx, eval_seed in enumerate(params.eval.seeds):
-        test_losses, test_stats, gt, _ = def3c.eval_probabilistic(
-            split="test",
-            seed=eval_seed,
-            num_samples=params.num_samples,
-            sample_chunk=params.sample_chunk,
-            return_samples=False,
-            compute_quantiles=True,
-            verbose=False,
-        )
+n_evaluations = params.num_exps * n_seeds
 
-        test_mae[cnt] += test_losses['mae']
-        test_rmse[cnt] += test_losses['rmse']
-        test_huber[cnt] += test_losses['huber']
-        test_r2[cnt] += test_losses['r2']
-        test_crps[cnt] += test_stats['crps_per_series']
+with tqdm(total=None, desc="Forecasts", unit="pred", position=0, leave=True, dynamic_ncols=True,
+          mininterval=0.5, file=sys.stderr, disable=not interactive,) as pbar:
 
-    n_seeds = len(params.eval.seeds)
-    test_mae[cnt] /= n_seeds
-    test_rmse[cnt] /= n_seeds
-    test_huber[cnt] /= n_seeds
-    test_r2[cnt] /= n_seeds
-    test_crps[cnt] /= n_seeds
+    for cnt, j in enumerate(range(start_id, start_id + params.num_exps)):
+        checkpoints_dir = '_'.join(params.exp.checkpoints_dir.split('_')[:-1]) + '_' + str(j)
+        best_epoch = params.best_epochs[cnt]
+        filepath = checkpoints_dir + '/checkpoint_epoch_ema_' + str(best_epoch) + '.zip'
+        def3c.load(filepath)
+        for seed_idx, eval_seed in enumerate(params.eval.seeds):
+            test_losses, test_stats, gt, _ = def3c.eval_probabilistic(split="test", seed=eval_seed,
+                                                                      batch_size=params.batch_size,
+                                                                      num_samples=params.num_samples,
+                                                                      sample_chunk=params.sample_chunk,
+                                                                      return_samples=False,
+                                                                      verbose=False,
+                                                                      progress_callback=update_progress,)
 
-    pbar.update(1)
-    print('\n' +
-        'Exp: ' + str(j) + ', best epoch: ' + str(params.best_epochs[cnt]) +
-        ', test. av. MAE: ' + f"{np.mean(test_mae[cnt]):.5f}" +
-        ', test. av. RMSE: ' + f"{np.mean(test_rmse[cnt]):.5f}" +
-        ', test. av. Huber: ' + f"{np.mean(test_huber[cnt]):.5f}" +
-        ', test. av. R2: ' + f"{np.mean(test_r2[cnt]):.5f}" +
-        ', test. av. CRPS: ' + f"{np.mean(test_crps[cnt]):.4f}" + '\n'
-    )
-    cnt += 1
+            test_mae[cnt] += test_losses["mae"]
+            test_rmse[cnt] += test_losses["rmse"]
+            test_huber[cnt] += test_losses["huber"]
+            test_r2[cnt] += test_losses["r2"]
+            test_crps[cnt] += test_stats["crps_per_series"]
 
-pbar.close()
+        # Average across seeds for this experiment.
+        test_mae[cnt] /= n_seeds
+        test_rmse[cnt] /= n_seeds
+        test_huber[cnt] /= n_seeds
+        test_r2[cnt] /= n_seeds
+        test_crps[cnt] /= n_seeds
+
+        summary = (f"Exp {j}, epoch {best_epoch} | " f"MAE={np.mean(test_mae[cnt]):.5f}, "
+                   f"RMSE={np.mean(test_rmse[cnt]):.5f}, " f"Huber={np.mean(test_huber[cnt]):.5f}, "
+                   f"R2={np.mean(test_r2[cnt]):.5f}, " f"CRPS={np.mean(test_crps[cnt]):.4f}")
+        if interactive:
+            tqdm.write(summary, file=sys.stderr)
+        else:
+            print(summary, flush=True)
 
 print('\nTest. av. MAE (across ' + str(params.num_exps) + ' experiments): ' + f"{np.mean(test_mae):.5f}")
 print('Test. av. RMSE (across ' + str(params.num_exps) + ' experiments): ' + f"{np.mean(test_rmse):.5f}")
@@ -106,5 +120,5 @@ write_metric_csv(prefix + '_test_crps.csv', test_crps)
 out_best_epochs = prefix + '_best_epochs.csv'
 with open(out_best_epochs, 'w', encoding='UTF8', newline='') as file:
     writer = csv.writer(file)
-    for j in range(cnt):
+    for j in range(params.num_exps):
         writer.writerow([f"{params.best_epochs[j]}"])

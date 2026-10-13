@@ -15,6 +15,7 @@ from model.conditioning_net import Conditioning_net
 from utils.data_utils import DataLoader
 from model.utils import Spatial_Encoding
 from typing import Optional
+import sys
 
 class DEF_3C:
    def __init__(self, params):
@@ -231,141 +232,272 @@ class DEF_3C:
        del data_loader
        return eval_losses, e_preds_all, e_f_all
 
-
    def eval_probabilistic(
            self,
            split: str = "test",
            seed: int = 0,
-           num_samples: int = 20,
+           batch_size: int = None,
+           num_samples: int = 100,
            sample_chunk: int = 8,
            return_samples: bool = False,
-           compute_quantiles: bool = True,
            verbose: bool = True,
+           progress_callback=None,
    ):
        """
-       Faster probabilistic evaluation.
+       Probabilistic evaluation over the entire dataset.
 
-       Main changes vs the previous version:
-         1) Samples are generated in mini-ensemble chunks, e.g. 8 samples at once.
-            This changes the effective network batch from B to sample_chunk * B.
-         2) It does NOT store all samples for the whole test set unless return_samples=True.
-         3) CRPS is computed per batch and accumulated with the correct normalization.
-         4) Predictive mean/std/quantiles are still returned, but only after CPU concatenation.
+       Args:
+           split: Dataset split.
+           seed: Random seed for diffusion sampling.
+           batch_size: Number of dataset windows processed per batch.
+               Defaults to self.params.training.batch_size.
+           num_samples: Number of predictions generated per window.
+           sample_chunk: Number of predictions generated simultaneously.
+           return_samples: Whether to return all generated predictions.
+           verbose: Display evaluation progress.
+           progress_callback: Optional callback for a shared progress bar.
 
-       Recommended starting point:
-           num_samples=20, sample_chunk=4 or 8, return_samples=False
+       Returns:
+           eval_losses_mean: MAE, MSE, RMSE, Huber, R2 per series.
+           stats: Mean, std, CRPS and optionally samples.
+           e_f_all: Ground-truth future observations.
+           stamps: Corresponding timestamps.
        """
+
+       if batch_size is None:
+           batch_size = self.params.training.batch_size
+
+       if batch_size < 1 or num_samples < 1 or sample_chunk < 1:
+           raise ValueError(
+               "batch_size, num_samples and sample_chunk must be positive."
+           )
+
        self.den_net.eval()
        self.cond_net.eval()
        self.sp_encoder.eval()
 
+       device = self.params.net.device
+       n_e = self.params.dataset.n_e
+       t_f = self.params.dataset.t_f
+
+       # ---------------------------------------------------------
+       # Dataset loader
+       # ---------------------------------------------------------
        data_loader = DataLoader(
            dataset=self.params.dataset.name,
            split=split,
            t_h=self.params.dataset.t_h,
-           t_f=self.params.dataset.t_f,
+           t_f=t_f,
            weather_locs_sel=np.arange(self.params.dataset.n_w),
-           plant_locs_sel=np.arange(self.params.dataset.n_e),
-           device=self.params.net.device,
+           plant_locs_sel=np.arange(n_e),
+           device=device,
            data_dir=self.params.dataset.data_dir,
        )
 
        data_ids = data_loader.get_data_ids()
-       num_batches = int(math.ceil(data_loader.get_size() / self.params.training.batch_size))
-       timesteps = list(range(self.params.diffusion.num_steps - 1, -1, -1))
-       device = self.params.net.device
+       n_windows = len(data_ids)
+       num_batches = (n_windows + batch_size - 1) // batch_size
 
-       if verbose:
-           pbar = tqdm(desc="Probabilistic evaluation progress", total=num_batches)
+       if n_windows == 0:
+           raise ValueError("The selected dataset split is empty.")
 
+       timesteps = range(self.params.diffusion.num_steps - 1, -1, -1)
+
+       # ---------------------------------------------------------
+       # Accumulators
+       # ---------------------------------------------------------
        mean_all = []
        std_all = []
        e_f_all_list = []
-       q05_all, q10_all, q25_all, q50_all, q75_all, q90_all, q95_all = [], [], [], [], [], [], []
        samples_all = [] if return_samples else None
 
-       # For normalized CRPS per series: sum_t CRPS_raw / sum_t |y_t|
-       crps_num = torch.zeros(self.params.dataset.n_e, dtype=torch.float64)
-       crps_den = torch.zeros(self.params.dataset.n_e, dtype=torch.float64)
-       with torch.inference_mode():
+       crps_num = torch.zeros(n_e, dtype=torch.float64)
+       crps_den = torch.zeros(n_e, dtype=torch.float64)
+
+       stamps = None
+
+       # ---------------------------------------------------------
+       # Evaluate all dataset windows in batches
+       # ---------------------------------------------------------
+       # A single progress bar when called independently. When invoked from
+       # replicate_results, use its callback instead (no nested tqdm bars).
+       interactive = sys.stderr.isatty()
+       with torch.inference_mode(), tqdm(
+               total=n_windows * num_samples,
+               desc="Forecasts",
+               unit="pred",
+               position=0,
+               leave=False,
+               dynamic_ncols=True,
+               mininterval=0.5,
+               file=sys.stderr,
+               disable=(not verbose or progress_callback is not None or not interactive),
+       ) as pbar:
+
            for batch_id in range(num_batches):
-               sample_ids = data_ids[
-                   batch_id * self.params.training.batch_size:
-                   (batch_id + 1) * self.params.training.batch_size
-               ]
-               [e_h_n, w_h_n, temp_h], [e_f_n, w_f_n, temp_f], timestamps = data_loader.get_batch_data(sample_ids)
+
+               # Select the next batch of dataset windows.
+               start = batch_id * batch_size
+               end = min(start + batch_size, n_windows)
+
+               sample_ids = data_ids[start:end]
+
+               (
+                   [e_h_n, w_h_n, temp_h],
+                   [e_f_n, w_f_n, temp_f],
+                   timestamps,
+               ) = data_loader.get_batch_data(sample_ids)
+
+               B = e_h_n.shape[0]
+
+               obs_shape = e_h_n.shape
+               fut_shape = e_f_n.shape
+               all_shape = (
+                   B,
+                   obs_shape[1],
+                   obs_shape[2],
+                   obs_shape[3] + fut_shape[3],
+               )
+
+               # -------------------------------------------------
+               # Timestamps and ground truth
+               # -------------------------------------------------
                single_index = timestamps[0].append(timestamps[1:])
-               if batch_id == 0:
+
+               if stamps is None:
                    stamps = single_index
                else:
                    stamps = stamps.append(single_index)
-               B = e_h_n.shape[0]
-               fut_shape = e_f_n.shape
-               obs_shape = e_h_n.shape
-               all_shape = (B, e_h_n.shape[1], e_h_n.shape[2], e_h_n.shape[3] + e_f_n.shape[3])
 
-               sp_e, sp_w, m_sp_ew = self.sp_encoder()
-               e_h_n = self.revin(e_h_n, mode="norm")
+               # Ground truth: [n_e, B * Tf]
+               e_f = (
+                   e_f_n.squeeze(1)
+                   .transpose(0, 1)
+                   .reshape(n_e, -1)
+                   .detach()
+                   .cpu()
+               )
 
-               in_cond = torch.cat([w_h_n, w_f_n], dim=-1)
-               in_temp = None
-               if self.params.dataset.t_channels > 0:
-                   in_temp = torch.cat([temp_h, temp_f], dim=-1)
-                   #in_temp = in_temp.repeat(1, 1, in_cond.shape[2], 1)
-
-               # Computed once per real batch, then repeated for ensemble chunks.
-               cond_emb = self.cond_net(in_cond, sp_emb_e=sp_e, sp_emb_w=sp_w, m_ew=m_sp_ew, t=in_temp)
-
-               # Ground truth, same layout as eval(): [S, B * Tf]
-               e_f = e_f_n.squeeze(1).transpose(0, 1).detach().cpu()
-               e_f = e_f.reshape(e_f.shape[0], -1)
                e_f_all_list.append(e_f)
                crps_den += e_f.abs().sum(dim=1).double()
 
+               # -------------------------------------------------
+               # Compute conditioning once per dataset batch
+               # -------------------------------------------------
+               sp_e, sp_w, m_sp_ew = self.sp_encoder()
+
+               e_h_n = self.revin(e_h_n, mode="norm")
+
+               in_cond = torch.cat([w_h_n, w_f_n], dim=-1)
+
+               in_temp = None
+               if self.params.dataset.t_channels > 0:
+                   in_temp = torch.cat(
+                       [temp_h, temp_f], dim=-1
+                   )
+
+               cond_emb = self.cond_net(
+                   in_cond,
+                   sp_emb_e=sp_e,
+                   sp_emb_w=sp_w,
+                   m_ew=m_sp_ew,
+                   t=in_temp,
+               )
+
+               # -------------------------------------------------
+               # Generate num_samples predictions per window
+               # -------------------------------------------------
                batch_samples = []
+               generated = 0
 
-               remaining = num_samples
-               chunk_start = 0
-               while remaining > 0:
-                   C = min(sample_chunk, remaining)
-                   remaining -= C
+               while generated < num_samples:
 
-                   # Expand real batch to ensemble batch: [C*B, ...]
+                   # Number of parallel predictions in this chunk.
+                   C = min(sample_chunk, num_samples - generated)
+                   BC = C * B
+
+                   obs_shape_rep = (
+                       BC, *obs_shape[1:]
+                   )
+                   fut_shape_rep = (
+                       BC, *fut_shape[1:]
+                   )
+                   all_shape_rep = (
+                       BC, *all_shape[1:]
+                   )
+
+                   # Repeat observations and conditioning.
                    e_h_rep = e_h_n.repeat(C, 1, 1, 1)
-                   obs_shape_rep = (C * B, obs_shape[1], obs_shape[2], obs_shape[3])
-                   fut_shape_rep = (C * B, fut_shape[1], fut_shape[2], fut_shape[3])
-                   all_shape_rep = (C * B, all_shape[1], all_shape[2], all_shape[3])
 
-                   cond_emb_rep = [cond_emb[0].repeat(C, 1, 1, 1), cond_emb[1].repeat(C, 1, 1, 1)]
+                   cond_emb_rep = [
+                       x.repeat(C, 1, 1, 1)
+                       for x in cond_emb
+                   ]
 
-                   in_obs = torch.cat([
-                       e_h_rep,
-                       torch.zeros(fut_shape_rep, device=device)
-                   ], dim=-1)
-                   in_obs_padded = self.pad_energy(in_obs, -1.0, 0.0)
+                   # Historical observations and empty future.
+                   in_obs = torch.cat(
+                       [
+                           e_h_rep,
+                           torch.zeros(
+                               fut_shape_rep, device=device
+                           ),
+                       ],
+                       dim=-1,
+                   )
 
+                   in_obs_padded = self.pad_energy(
+                       in_obs, -1.0, 0.0
+                   )
+
+                   # ---------------------------------------------
+                   # Initialize diffusion noise
+                   # ---------------------------------------------
                    gen = torch.Generator(device=device)
-                   gen.manual_seed(seed + 100000 * batch_id + chunk_start)
-                   noise_f = torch.randn(fut_shape_rep, device=device, generator=gen)
-                   noise = torch.cat([
-                       torch.zeros(obs_shape_rep, device=device),
-                       noise_f
-                   ], dim=-1)
-                   noise_padded = self.pad_energy(noise, 0.0, 1.0)
-                   in_den = torch.cat([in_obs_padded, noise_padded], dim=1)
+                   gen.manual_seed(
+                       seed + 100000 * batch_id + generated
+                   )
+
+                   noise_f = torch.randn(
+                       fut_shape_rep,
+                       device=device,
+                       generator=gen,
+                   )
+
+                   noise = torch.cat(
+                       [
+                           torch.zeros(
+                               obs_shape_rep, device=device
+                           ),
+                           noise_f,
+                       ],
+                       dim=-1,
+                   )
+
+                   noise_padded = self.pad_energy(
+                       noise, 0.0, 1.0
+                   )
+
+                   in_den = torch.cat(
+                       [in_obs_padded, noise_padded],
+                       dim=1,
+                   )
 
                    empty_self_cond = self.make_empty_self_cond(
                        all_shape_rep,
                        device=device,
                        dtype=in_den.dtype,
                    )
+
                    self_cond = empty_self_cond
 
+                   # ---------------------------------------------
+                   # Reverse diffusion
+                   # ---------------------------------------------
                    for t in timesteps:
                        use_sc_now = self.use_self_cond_at_step(t)
 
                        t_batch = torch.full(
-                           (C * B,),
+                           (BC,),
                            t,
                            device=device,
                            dtype=torch.long,
@@ -373,15 +505,19 @@ class DEF_3C:
 
                        out = self.den_net(
                            sample=in_den,
-                           self_cond=self_cond if use_sc_now else empty_self_cond,
+                           self_cond=(
+                               self_cond
+                               if use_sc_now
+                               else empty_self_cond
+                           ),
                            sp_emb=sp_e,
                            cond_emb=cond_emb_rep,
                            timesteps=t_batch,
                        )
 
                        carry_to_next = (
-                           t > 0
-                           and self.use_self_cond_at_step(t - 1)
+                               t > 0
+                               and self.use_self_cond_at_step(t - 1)
                        )
 
                        in_den, self_cond = self.reverse_step(
@@ -394,67 +530,122 @@ class DEF_3C:
                            carry_self_cond=carry_to_next,
                        )
 
-                   e_preds_f = in_den[:, [-1], :, -2 * self.params.dataset.t_f:]
+                   # ---------------------------------------------
+                   # Extract forecast
+                   # ---------------------------------------------
+                   e_preds_f = in_den[
+                       :, [-1], :, -2 * t_f:
+                   ]
                    e_preds_f = e_preds_f[:, :, :, ::2]
 
-                   # Manual RevIN denorm because batch dimension was expanded from B to C*B.
-                   mean_rep = self.revin.mean.repeat(C, 1, 1, 1)
-                   std_rep = self.revin.stdev.repeat(C, 1, 1, 1)
-                   e_preds_f = e_preds_f * std_rep + mean_rep
+                   # Reverse RevIN normalization.
+                   mean_rep = self.revin.mean.repeat(
+                       C, 1, 1, 1
+                   )
+                   std_rep = self.revin.stdev.repeat(
+                       C, 1, 1, 1
+                   )
 
-                   # [C*B, 1, S, Tf] -> [C, S, B*Tf]
-                   e_preds = e_preds_f.view(C, B, 1, e_preds_f.shape[2], e_preds_f.shape[3])
-                   e_preds = e_preds.squeeze(2).permute(0, 2, 1, 3).contiguous()
-                   e_preds = e_preds.view(C, e_preds.shape[1], -1).detach().cpu()
+                   e_preds_f = (
+                           e_preds_f * std_rep + mean_rep
+                   )
+
+                   # [C*B, 1, n_e, Tf]
+                   # -> [C, n_e, B*Tf]
+                   e_preds = e_preds_f.reshape(
+                       C, B, 1, n_e, t_f
+                   )
+
+                   e_preds = (
+                       e_preds.squeeze(2)
+                       .permute(0, 2, 1, 3)
+                       .contiguous()
+                       .reshape(C, n_e, B * t_f)
+                       .detach()
+                       .cpu()
+                   )
 
                    if "GEFCOM2014" in self.params.dataset.name:
                        e_preds = e_preds.clamp(0.0, 1.0)
 
                    batch_samples.append(e_preds)
-                   chunk_start += C
 
-               # [K, S, B*Tf], only for this batch.
-               batch_samples = torch.cat(batch_samples, dim=0)
+                   generated += C
 
-               # Batch summary stats.
+                   if progress_callback is not None:
+                       progress_callback(
+                           completed=B * C,
+                           n_windows=n_windows,
+                           batch_id=batch_id + 1,
+                           num_batches=num_batches,
+                           generated=generated,
+                           num_samples=num_samples,
+                       )
+                   elif verbose and interactive:
+                       pbar.set_postfix_str(
+                           f"B{batch_id + 1}/{num_batches} "
+                           f"K{generated}/{num_samples}",
+                           refresh=False,
+                       )
+                       pbar.update(B * C)
+
+               # -------------------------------------------------
+               # Combine ensemble predictions for current batch
+               # [num_samples, n_e, B*Tf]
+               # -------------------------------------------------
+               batch_samples = torch.cat(
+                   batch_samples, dim=0
+               )
+
+               # Mean and standard deviation.
                mean_b = batch_samples.mean(dim=0)
-               std_b = batch_samples.std(dim=0)
+               std_b = batch_samples.std(
+                   dim=0,
+                   unbiased=(num_samples > 1),
+               )
+
                mean_all.append(mean_b)
                std_all.append(std_b)
 
-               if compute_quantiles:
-                   q_levels = torch.tensor([0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95])
-                   q = torch.quantile(batch_samples.float(), q_levels, dim=0)
-                   q05_all.append(q[0])
-                   q10_all.append(q[1])
-                   q25_all.append(q[2])
-                   q50_all.append(q[3])
-                   q75_all.append(q[4])
-                   q90_all.append(q[5])
-                   q95_all.append(q[6])
 
                if return_samples:
                    samples_all.append(batch_samples)
 
-               # Exact ensemble CRPS for this batch, accumulated raw then normalized globally.
-               crps_raw = crps_ensemble_raw(batch_samples.float(), e_f.float())  # [S, B*Tf]
+               # -------------------------------------------------
+               # CRPS for current batch
+               # -------------------------------------------------
+               crps_raw = crps_ensemble_raw(
+                   batch_samples.float(),
+                   e_f.float(),
+               )
+
                crps_num += crps_raw.sum(dim=1).double()
 
-               if verbose:
-                   pbar.update(1)
+               # In consoles without terminal control (e.g. some PyCharm
+               # Debug consoles), report one line only after each batch.
+               if progress_callback is None and verbose and not interactive:
+                   print(
+                       f"Batch {batch_id + 1}/{num_batches}: "
+                       f"{end}/{n_windows} windows; "
+                       f"{num_samples} predictions/window",
+                       flush=True,
+                   )
 
-       if verbose:
-           pbar.close()
        del data_loader
 
+       # ---------------------------------------------------------
+       # Combine results from all dataset batches
+       # ---------------------------------------------------------
        pred_mean = torch.cat(mean_all, dim=-1)
        pred_std = torch.cat(std_all, dim=-1)
        e_f_all = torch.cat(e_f_all_list, dim=-1)
 
-
+       # ---------------------------------------------------------
+       # Deterministic metrics using predictive mean
+       # ---------------------------------------------------------
        mae, mse, rmse, huber, r2 = losses_cmpt(
-           pred=pred_mean.to(torch.float32),
-           gt=e_f_all.to(torch.float32),
+           pred=pred_mean.float(),
+           gt=e_f_all.float(),
            delta=self.params.training.huber_delta,
        )
 
@@ -466,7 +657,13 @@ class DEF_3C:
            "r2": r2.detach().cpu().numpy(),
        }
 
-       crps_per_series = (crps_num / crps_den.clamp_min(1e-12)).detach().cpu()
+       # ---------------------------------------------------------
+       # Normalized CRPS
+       # ---------------------------------------------------------
+       crps_per_series = (
+               crps_num / crps_den.clamp_min(1e-12)
+       ).detach().cpu()
+
        stats = {
            "mean": pred_mean,
            "std": pred_std,
@@ -474,42 +671,9 @@ class DEF_3C:
            "crps_per_series": crps_per_series.numpy(),
        }
 
-       if compute_quantiles:
-           q05 = torch.cat(q05_all, dim=-1)
-           q10 = torch.cat(q10_all, dim=-1)
-           q25 = torch.cat(q25_all, dim=-1)
-           q50 = torch.cat(q50_all, dim=-1)
-           q75 = torch.cat(q75_all, dim=-1)
-           q90 = torch.cat(q90_all, dim=-1)
-           q95 = torch.cat(q95_all, dim=-1)
-
-           stats["q05"] = q05
-           stats["q10"] = q10
-           stats["q25"] = q25
-           stats["q50"] = q50
-           stats["q75"] = q75
-           stats["q90"] = q90
-           stats["q95"] = q95
-
-           # Prediction Interval Coverage Probability and
-           # Prediction Interval Normalized Average Width.
-           # 50% interval: [q25, q75]
-           # 80% interval: [q10, q90]
-           # 90% interval: [q05, q95]
-           y_range = (e_f_all.max(dim=1).values - e_f_all.min(dim=1).values).clamp_min(1e-8)
-           intervals = {
-               "50": (q25, q75),
-               "80": (q10, q90),
-               "90": (q05, q95),
-           }
-           for level, (q_low, q_high) in intervals.items():
-               stats[f"picp{level}_per_series"] = (
-                   ((e_f_all >= q_low) & (e_f_all <= q_high)).float().mean(dim=1).numpy()
-               )
-               stats[f"pinaw{level}_per_series"] = (
-                   ((q_high - q_low).mean(dim=1) / y_range).numpy()
-               )
-
+       # ---------------------------------------------------------
+       # Optionally return full ensemble predictions
+       # ---------------------------------------------------------
        if return_samples:
            stats["samples"] = torch.cat(samples_all, dim=-1)
 
@@ -1464,7 +1628,6 @@ def crps_ensemble(samples: torch.Tensor, y: torch.Tensor, reduce: str = "none") 
 
     crps = term1 - term2  # [S,T]
 
-    # ----- Normalize like your quantile version -----
     denom_series = torch.sum(torch.abs(y), dim=1).clamp_min(1e-12)  # [S]
 
     if reduce == "none":
@@ -1475,27 +1638,6 @@ def crps_ensemble(samples: torch.Tensor, y: torch.Tensor, reduce: str = "none") 
         return torch.mean(torch.sum(crps, dim=1) / denom_series)
 
 #  -----------------------------------
-
-
-def quantile_loss_no_mask(target, q_pred, q):
-    return 2.0 * torch.sum(
-        torch.abs((q_pred - target) * ((target <= q_pred).float() - q)),
-        dim=-1
-    )
-
-def calc_quantile_CRPS_no_mask(forecast, target, eps=1e-8):
-    # forecast: [K, S, T]
-    # target:   [S, T]
-    quantiles = torch.arange(0.05, 1.0, 0.05, device=forecast.device)
-    denom = torch.sum(torch.abs(target), dim=-1).clamp_min(eps)  # [S]
-
-    crps = 0.0
-    for q in quantiles:
-        q_pred = torch.quantile(forecast, q.item(), dim=0)  # [S, T]
-        q_loss = quantile_loss_no_mask(target, q_pred, q.item())  # [S]
-        crps = crps + q_loss / denom
-
-    return crps / len(quantiles)  # [S]
 
 def excess_temporal_variation_score_loss(
     y_pred: torch.Tensor,
@@ -1730,68 +1872,6 @@ def daily_energy_loss(
     return (
         daily_loss_map * valid_day
     ).sum() / valid_day.sum().clamp_min(1.0)
-
-import torch
-
-
-def solar_hour_importance_from_history(
-    e_h: torch.Tensor,
-    horizon: int,
-    points_per_day: int = 24,
-    start_hour: int = 0,
-    q: float = 0.5,
-    power: float = 1.5,
-    w_min: float = 0.10,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    e_h: B x 1 x S x T_h
-    Returns: B x 1 x S x horizon
-
-    Learns a soft daily solar-weight profile from historical energy.
-    q=0.5 is median across historical days.
-    q=0.7 gives more emphasis to the typical clear/high-generation shape.
-    """
-    B, C, S, T_h = e_h.shape
-
-    if T_h < points_per_day:
-        raise ValueError("History must contain at least one full day.")
-
-    num_days = T_h // points_per_day
-    usable_T = num_days * points_per_day
-
-    # Keep only complete days, using the most recent history.
-    hist = e_h[..., -usable_T:]  # B x 1 x S x (D * P)
-    hist = hist.reshape(B, C, S, num_days, points_per_day)
-
-    # Typical production at each hour of the day.
-    # Median is robust to cloudy/outlier days.
-    hourly_profile = torch.quantile(hist.detach(), q=q, dim=-2)
-    # B x 1 x S x P
-
-    # Normalize independently per sample and site.
-    hourly_profile = hourly_profile.clamp_min(0.0)
-    profile_max = hourly_profile.amax(dim=-1, keepdim=True).clamp_min(eps)
-    hourly_profile = hourly_profile / profile_max
-
-    # Align profile with the first forecast hour.
-    future_hour_idx = (
-        torch.arange(horizon, device=e_h.device) + start_hour
-    ) % points_per_day
-
-    importance = hourly_profile[..., future_hour_idx]
-    # B x 1 x S x horizon
-
-    # Convert [0, 1] importance into nonzero loss weights.
-    weights = w_min + (1.0 - w_min) * importance.pow(power)
-
-    return weights
-
-
-import torch
-import torch.nn.functional as F
-from typing import Optional
-
 
 def excess_temporal_smoothness_loss_global(
         y_pred: torch.Tensor,

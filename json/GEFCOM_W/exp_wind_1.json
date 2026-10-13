@@ -45,7 +45,7 @@
 		"batch_size": 16,
 		"dropout": 0.1,
 		"dropout_att": 0.1,
-	    "dropout_cond": 0.1,
+	    "dropout_cond": 0.05,
 		"weight_decay_den": 2e-4,
 		"weight_decay_cond": 2e-4,
 		"weight_decay_sp": 2e-4,

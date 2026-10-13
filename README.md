@@ -66,12 +66,14 @@ python3.12 ./replicate_results.py --json ./json/GEFCOM_W/exp_wind_1.json --best_
 ```
 
 **Table 1.** Evaluation results for GEFCom2014-Wind: Mean Absolute Error (MAE), Root Mean Square Error (RMSE), coefficient of determination (R²), and Continuous Ranked Probability Score (CRPS).
+0.825	0.591	0.674	0.657	0.690	0.688	0.842	0.660	0.723	0.533	0.6882
+<img width="675" height="17" alt="image" src="https://github.com/user-attachments/assets/6bb54948-d831-4bad-9dfc-7bc59c9d5f60" />
 
 | Metric | I | II | III | IV | V | VI | VII | VIII | IX | X | All |
 |:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | MAE | 0.075 | 0.097 | 0.111 | 0.121 | 0.126 | 0.125 | 0.069 | 0.090 | 0.087 | 0.143 | 0.104 |
 | RMSE | 0.110 | 0.144 | 0.149 | 0.185 | 0.182 | 0.185 | 0.097 | 0.148 | 0.128 | 0.217 | 0.154 |
-| R² | 0.825 | 0.591 | 0.680 | 0.654 | 0.688 | 0.685 | 0.845 | 0.659 | 0.722 | 0.526 | 0.687 |
+| R² | 0.825 | 0.591 | 0.674 | 0.657 | 0.690 | 0.688 | 0.842 | 0.660 | 0.723 | 0.533 | 0.688 |
 | CRPS | 0.214 | 0.243 | 0.219 | 0.283 | 0.231 | 0.221 | 0.190 | 0.269 | 0.268 | 0.259 | 0.240 |
 
 ### GEFCom2014-Solar
